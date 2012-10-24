@@ -1,0 +1,34 @@
+# Include your customized HAL commands here
+# This file will not be overwritten when you run stepconf again
+
+loadrt I2C
+loadrt ADC2Temp
+loadrt comp
+
+addf I2C.0 base-thread -3
+addf ADC2Temp.0 servo-thread
+addf comp.0 servo-thread
+
+net SDAOut <= I2C.0.SDAOut
+net SCLOut <= I2C.0.SCLOut
+net SDAIn => I2C.0.SDAIn
+
+net SDAOut => parport.0.pin-14-out
+setp parport.0.pin-14-out-invert 1
+net SCLOut => parport.0.pin-16-out
+net SDAIn <= parport.0.pin-15-in
+
+net ADCRaw <= I2C.0.AnalogOut0
+net ADCNew <= I2C.0.NewValue0
+
+net ADCRaw => ADC2Temp.0.ADCIn
+net ADCNew => ADC2Temp.0.NewValue
+net e0.temp.meas <= ADC2Temp.0.TempOut
+
+setp comp.0.hyst 0.25
+net e0.temp.meas => comp.0.in0
+net ext.temp.set => comp.0.in1
+net e0.htr.on <= comp.0.out
+net e0.htr.on => parport.0.pin-17-out
+setp parport.0.pin-17-out-invert 1
+

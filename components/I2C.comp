@@ -1,0 +1,262 @@
+/******************************************************************************
+ *
+ * Copyright (C) 2012 Charles Steinkuehler (charles AT steinkuehler DOT net)
+ *
+ *
+ * This module implements a crude I2C interface to an ADC intended to assist
+ * in connecting LinuxCNC with a 3D printer
+ *
+ ******************************************************************************
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of version 2 of the GNU General
+ * Public License as published by the Free Software Foundation.
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111 USA
+ *
+ * THE AUTHORS OF THIS LIBRARY ACCEPT ABSOLUTELY NO LIABILITY FOR
+ * ANY HARM OR LOSS RESULTING FROM ITS USE.  IT IS _EXTREMELY_ UNWISE
+ * TO RELY ON SOFTWARE ALONE FOR SAFETY.  Any machinery capable of
+ * harming persons must have provisions for completely removing power
+ * from all motors, etc, before persons enter any danger area.  All
+ * machinery must be designed to comply with local and national safety
+ * codes, and the authors of this software can not, and do not, take
+ * any responsibility for such compliance.
+ *
+ * This code was written as part of the LinucCNC HAL project.  For more
+ * information, go to www.linuxcnc.org.
+ *
+ ******************************************************************************/
+
+component I2C "I2C Interface";
+
+description """Crude I2C Interface.  Reads analog data from hard-coded address, and assumes an ADC101C021.""";
+
+pin in  bit SDAIn  "SDA Input";
+pin out bit SDAOut "SDA Output";
+pin out bit SCLOut "SCL Output";
+
+//param rw unsigned cmdparm[5] = { 0x01, 0x102, 0x103, 0x204, 0x205 } "I2C Command Parameter";
+pin out unsigned AnalogOut# [2] "ADC Result";
+pin out bit      NewValue#  [2] "Toggles to indicate new value on Analog";
+
+// Debugging
+param r  unsigned RawRxData# [5] "Data received from I2C bus";
+param r  unsigned RawRxBit "Internal Rx Bit from SDA";
+
+function _ nofp;
+license "GPLv2 or greater";
+author "Charles Steinkuehler";
+
+variable int dir;
+variable u16 TxByte;
+variable u16 TxBit;
+variable u16 RxByte;
+variable u16 RxBit;
+variable u16 RxData [5];
+variable int CmdByte = 0; 
+variable int RxByteNum = 0;
+variable int ByteState = 0;
+variable int BitState = 0;
+;;
+
+
+// #include <rtapi_math.h>
+
+// u16 I2C data byte breaks down into:
+// 0x00FF Data Byte : Data byte to transmit if Direction=Write
+// 0x0100 Ack       : Ack value to transmit if Direction=Read
+//                  : 1=Send Ack (SDA low)
+// 0x0200 Skip-Ack  : 1=Skip ack bit (required for some broken I2C devices)
+// 0x0400 Start     : 1=Generate Start before Data_Byte is transfered
+// 0x0800 Stop      : 1=Generate Stop after Ack is transfered
+// 0x1000 Direction : 1=Read, 0=Write
+// 0xE000 Reserved
+
+
+    enum I2C_Byte_State
+    {                               // Byte State Definitions
+        eIdle               = 0,    // 0000 = Idle    
+        eStart              = 1,    // 0001 = Start   
+        eBit7               = 2,    // 0010 = Bit7    
+        eBit6               = 3,    // 0011 = Bit6    
+        eBit5               = 4,    // 0100 = Bit5    
+        eBit4               = 5,    // 0101 = Bit4    
+        eBit3               = 6,    // 0110 = Bit3    
+        eBit2               = 7,    // 0111 = Bit2    
+        eBit1               = 8,    // 1000 = Bit1    
+        eBit0               = 9,    // 1001 = Bit0    
+        eAck                = 10,   // 1010 = Ack     
+        eStop               = 11,   // 1011 = Stop    
+        eNewByte            = 12,   // 1100 = Reserved
+        eReserved_13        = 13,   // 1101 = Reserved
+        eReserved_14        = 14,   // 1110 = Reserved
+        eReserved_15        = 15    // 1111 = Reserved
+    };
+
+    enum I2C_Bit_State
+    {
+        eBitIdle            = 0,
+        eSDA_Valid          = 1,
+        eSCL_High           = 2,
+        eSCL_Low            = 3,
+        eBitStart           = 4,
+        eBitStop            = 5,
+        eNewBit             = 6
+    };
+
+// Clock out a bunch of ones and send a stop, in case I2C bus got confused
+const u16 command_init[5] = { 0x00FF, 0x00FF, 0x00FF, 0x00FF, 0x08FF };
+
+// Select register 0 (conversion result) and read two bytes
+const u16 command[5] = { 0x04a8, 0x0000, 0x04a9, 0x1100, 0x1800 };
+
+FUNCTION(_)
+{
+    unsigned RxValue;
+
+    // Command state machine
+    // Cycles through all Tx/Rx bytes then repeats
+    if (ByteState==eIdle) {
+        if (CmdByte==0 && RxByteNum != 0){
+            RxValue  = (RxData[4] & 0xFC) >> 2;
+            RxValue |= (RxData[3] & 0x0F) << 6;
+            AnalogOut(0) = RxValue;
+            NewValue(0)  = ! NewValue(0);
+        }
+        ByteState = eNewByte;
+        TxByte = command[CmdByte];
+        RxByte = 0;
+        RxByteNum = CmdByte;
+        CmdByte++;
+        if (CmdByte == 5)  {
+            CmdByte = 0;
+        }
+
+        if ((TxByte & 0x1000) == 0x1000) {
+            dir = 1; // Read
+        } else {
+            dir = 0; // Write
+        }
+
+    }
+
+    // Byte state machine
+    // Cycles through the various bits in a byte until all are transmitted
+    if (BitState==eBitIdle || BitState==eSCL_Low) {
+        switch (ByteState) {
+        case eNewByte :
+            if ((TxByte & 0x0400) == 0x0400) {
+                ByteState = eStart;
+                TxBit = 1;
+                BitState = eNewBit;
+            } else {
+                ByteState = eBit7;
+                TxBit = (dir==0) ? (TxByte >> 7) & 0x01 : 1;
+                BitState = eNewBit;
+            }
+            break;
+        case eStart:
+        case eBit7 :
+        case eBit6 :
+        case eBit5 :
+        case eBit4 :
+        case eBit3 :
+        case eBit2 :
+        case eBit1 :
+            ByteState++;
+            TxBit = (dir==0) ? (TxByte >> (eBit0 - ByteState)) & 0x01 : 1;
+            BitState = eNewBit;
+            if (ByteState != eStart) {
+                RxByte <<= 1;
+                RxByte |= RxBit;
+            }
+            break;
+        case eBit0 :
+            ByteState = eAck;
+            TxBit = (dir==0) ? 1 : ((TxByte >> 8) & 0x01) ^ 0x01;
+            BitState = eNewBit;
+            RxByte <<= 1;
+            RxByte |= RxBit;
+            break;
+        case eAck :
+            if ((TxByte & 0x0800) == 0x0800) {
+                ByteState = eStop;
+                TxBit = 0;
+                BitState = eNewBit;
+            } else {
+                ByteState = eIdle;
+            }
+            if (RxBit==0)  {
+                RxByte |= 0x0100;
+            }
+            RxData[RxByteNum] = RxByte;
+            // Debugging
+            RawRxData(RxByteNum) = RxByte;
+            break;
+        case eStop :
+        default    :
+            ByteState = eIdle;
+        }
+    }
+
+    // Bit state machine
+    // Cycles through the various states required to send one bit on the I2C bus
+    // Bit type : State transitions
+    // Start : eSDA_Valid (SDA=1) -> eSCL_High -> eBitStart (SDA=0) -> eSCL_Low
+    // Normal: eSDA_Valid (SDA=x) -> eSCL_High -> eSCL_Low
+    // Stop  : eSDA_Valid (SDA=0) -> eSCL_High -> eBitStop  (SDA=1) -> eIdle
+    switch (BitState) {
+    case eNewBit :
+        BitState = eSDA_Valid;
+        SDAOut = TxBit;
+        break;
+    case eSDA_Valid :
+        BitState = eSCL_High;
+        SCLOut = 1; 
+        break;
+    case eSCL_High : 
+        if (SDAIn == 0) {
+            RxBit = 0x00;
+        } else {
+            RxBit = 0x01;
+        }
+        RawRxBit  = SDAIn;
+        if (ByteState==eStart) {
+            BitState = eBitStart;
+            SDAOut = 0;
+        } else {
+            if (ByteState==eStop) {
+                BitState = eBitStop;
+                SDAOut = 1;
+            } else {
+                BitState = eSCL_Low;
+                SCLOut = 0; 
+            }
+        }
+        break;
+    case eSCL_Low : 
+        BitState = eBitIdle;
+        break;
+    case eBitStart :
+        BitState = eSCL_Low;
+        SCLOut = 0;
+        break;
+    case eBitStop :
+        BitState = eBitIdle;
+        SCLOut = 1;
+        break;
+    default :
+        BitState = eBitIdle;
+        SCLOut = 1;
+        SDAOut = 1;
+    }
+}
+
+
